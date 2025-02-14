@@ -1,0 +1,671 @@
+---
+title: R and **Seurat** to analyse single cell RNA-seq
+subtitle: Case study - NKG2A and HLA-E define an alternative immune checkpoint axis in bladder cancer
+author: Clarice Groeneveld
+editor: 
+  markdown: 
+    wrap: 72
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    toc-title: Contents
+    lightbox: true
+    code-fold: true
+    code-tools: true
+---
+
+Download this notebook: https://github.com/downloads/csgroen/teaching/20240214_Tutorial_DU_Seurat.qmd
+
+## Pre-requisites
+
+For the best understanding of this tutorial, please make sure you have at least an intermediate understanding of R. Here are some recommended resources to learn the basics and necessary intermediate concepts:
+
+1.  swirl: https://swirlstats.com/students.html
+
+Specifically courses *R Programming*, *Getting and Cleaning Data* and *Exploratory Data Analysis* may provide a good jump start.
+
+2.  Hands On Programming with R: https://rstudio-education.github.io/hopr/
+
+The very basics of R programming as also explained in this thorough book from the Posit team (that builds RStudio).
+
+3.  R for Data Science: https://r4ds.hadley.nz/
+
+This goes further than we need, but a base for most of the programming questions a data analyst working in R could have to start with.
+
+## Resources
+
+Seurat has many very useful tutorials for all of its features. Elements of this case study were taken from the following:
+
+1.  Seurat - Guided Clustering Tutorial https://satijalab.org/seurat/archive/v3.0/pbmc3k_tutorial.html
+2.  Introduction to scRNA-seq integration: https://satijalab.org/seurat/articles/integration_introduction
+3.  Mapping and annotating query datasets: https://satijalab.org/seurat/articles/integration_mapping
+
+## Install packages
+
+To ensure we have all installed libraries, we'll use R package "pacman", which allows us to check if packages are not installed and load them. This is not a replacement for more comprehensive version control (e.g. using `renv`), but it's simple to install and very lightweight.
+
+```{r}
+if(! "pacman" %in% installed.packages()) install.packages("pacman")
+pacman::p_load("Seurat", "tidyverse", "R.utils", "ggpubr", "patchwork", 
+               "celldex", "SingleR", "scRNAseq", "pheatmap",
+               "ggsci", "scds")
+
+```
+
+I'm personally not a big fan of the standard look of Seurat plots, so I'll apply this ggplot2 theme to (almost) all Seurat plots we generate:
+
+```{r}
+theme_clean <-
+  theme_linedraw() +
+  theme(panel.grid = element_blank(),
+        panel.border = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+```
+
+> Note: Seurat plots are ggplot-based and therefore can be "added to" in a grammar-of-graphics manner. Plots for multiple features are patchworks, which use a slightly different syntax to add to (this is why sometimes you'll see `&` instead of `+` being used).
+
+## Download data
+
+Our dataset comes from Salomé et al (2022) \[https://www.sciencedirect.com/science/article/pii/S1535610822003695\], "NKG2A and HLA-E define an alternative immune checkpoint axis in bladder cancer". This single-cell data is a bit particular: they have FACS-sorted their cells into CD45+ and CD45-, notably to enrich their dataset in hematopoetic cells.
+
+We'll download the data from the link provided in the article:
+
+```{r}
+#| eval: false
+dir.create("data")
+download.file("https://prod-dcd-datasets-cache-zipfiles.s3.eu-west-1.amazonaws.com/7yb7s9769c-1.zip", 'data/Salome_2022.zip')
+unzip('data/Salome_2022.zip', exdir = "data")
+```
+
+## Read 10X data
+
+```{r}
+ref_dir <- "data/NKG2A and HLA-E define an alternative immune checkpoint axis in bladder cancer/"
+list.files(ref_dir)
+```
+
+We can see the data is distributed as one folder per dataset, and includes the bulk data, which we're not going to use. For this reason, I will filter out the "bulk" folders and to get my vector of `sc_dts` (single-cell datasets).
+
+```{r}
+sc_dts <- ref_dir |> list.files() |> str_subset("bulk", negate = TRUE)
+sc_dts
+```
+
+> **Syntax note:** `ref_dir |> list.files() |> str_subset("bulk", negate = TRUE)` is equivalent to `str_subset(list.files(ref_dir), "bulk", negate = TRUE)`. The `|>` was first introduced as `%>%` from R package magrittr and officially incorporated into base R\>=4.0. It's purpose is to increase code legibility through "chaining" commands instead of "nesting" them. If you would like to learn more, you can check the help file `? |>`
+
+We can check inside each folder:
+
+```{r}
+ref_dir |> filePath(sc_dts[1]) |> list.files()
+```
+
+This is a common export of single-cell data and can be read directly into Seurat using function `Read10X`.
+
+This snippet will read all of our samples at once:
+
+```{r}
+read_exp_sample <- function(sc_file) {
+  message('Reading file: ', sc_file)
+  so <- ref_dir |> filePath(sc_file) |> Read10X()
+  so <- CreateSeuratObject(so, project = "BLCA_NKG2A")
+  so[["sample"]] <- str_remove(sc_file, "^.{4}")
+  so[["patient"]] <- str_extract(sc_file, "Patient..")
+  so[["CD45"]] <- str_extract(sc_file, "(?<=CD45).*")
+  return(so)
+}
+
+sc_data <- lapply(sc_dts, read_exp_sample)
+names(sc_data) <- sc_dts
+```
+
+### Merge samples
+
+The script we ran generated 10 Seurat objects, which we will merge into one for further analysis. Each count matrix, at first, will be stored as a `Layer` in our Seurat object.
+
+```{r}
+sc_data <- merge(sc_data[[1]], sc_data[2:length(sc_data)])
+```
+
+## Seurat syntax basics for object accession
+
+Here are some "essential commands" for accession of information inside the Seurat object :<https://satijalab.org/seurat/articles/essential_commands.html>.
+
+The document also outlines the "basic pipeline".
+
+To see some general info about the object, we can just print it:
+
+```{r}
+sc_data
+```
+
+Note the layers, for the different samples. We can also see what analyses have been run in this object (none yet).
+
+#### Cell metadata
+
+`[[]]` allows us to access the cell metadata in a concise manner:
+
+```{r}
+sc_data[[]] |> head()
+```
+
+#### Assay matrix (e.g. counts)
+
+To get matrices from the Seurat objects, there are many "official" ways, but one of these two, which have exactly the same output, should work well:
+
+```{r}
+GetAssayData(sc_data, layer = "counts.1")[1:5,1:5]
+sc_data[["RNA"]]$counts.1[1:5,1:5]
+```
+
+### UMI ids
+
+To get the "ids" of the cells, we can simply call:
+
+```{r}
+Cells(sc_data)[1:5]
+```
+
+### Features
+
+For a single-cell RNA-seq object, we can see the genes (features) like so:
+
+```{r}
+Features(sc_data)[1:5]
+```
+
+## Pre-processing workflow
+
+There are very standard steps for pre-processing, but that require some level of decision on the part of the user. The basic tutorial of Seurat, on PBMCs, covers this in detail: https://satijalab.org/seurat/articles/pbmc3k_tutorial
+
+### QC and selecting cells for further analysis
+
+This command will figure out the percentage of reads of mitchondrial RNA:
+
+```{r}
+sc_data[["percent.mt"]] <- PercentageFeatureSet(sc_data, pattern = "^MT-")
+```
+
+There are three major pieces of information we'd like to check to make filtering decisions: number of expressed features, number of reads and the percentage of mitochondrial RNA. Here, I plot per sample:
+
+```{r fig.width=10, fig.height=4}
+(VlnPlot(sc_data, 
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+        group.by = "sample",
+        alpha = 0.3, 
+        ncol = 3) &
+  theme_clean) +
+  plot_layout(guides = "collect")
+```
+
+We can also plot this for a particular known variable. For example, here I show for whether the cells were FACS-sorted as CD45 positive or negative:
+
+```{r fig.width=10, fig.height=4}
+(VlnPlot(sc_data, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+         alpha = 0.3,
+         group.by = "CD45", ncol = 3) &
+  stat_compare_means() &
+  theme_clean) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "CD45")
+```
+
+### Filtering and Normalization
+
+We'll reproduce the filtering and normalization steps proposed by the paper as closely as possible:
+
+> For each sample, cells were first selected as expressing less than 16–20% mitochondrial genes and displaying a minimum of 200–300 and a maximum of 2500–3500 features.
+
+As we're standardizing pre-processing for all samples, we'll take the least stringent:
+
+```{r}
+sc_data <- subset(sc_data, subset = nFeature_RNA > 200 & nFeature_RNA < 3500 & percent.mt < 20)
+```
+
+> Data were then log-normalized using a scale factor of 10,000.
+
+```{r}
+sc_data <- NormalizeData(sc_data, normalization.method = "LogNormalize", scale.factor = 1e4)
+```
+
+### Feature selection and PCA
+
+> The 2,000 most variable features were then identified, data were scaled based on all the features \[...\]
+
+```{r}
+sc_data <- FindVariableFeatures(sc_data, nfeatures = 2000)
+sc_data <- ScaleData(sc_data, features = rownames(sc_data))
+```
+
+> \[...\] and principal component analysis was performed.
+
+```{r}
+sc_data <- RunPCA(sc_data)
+gc()
+```
+
+We can visualize the PCA with `DimPlot`, coloring by different categorical variables. Here, we see the influence of both the sample (batch) and CD45 positive vs negative (which is correlated to batch but might also contribute to variance).
+
+```{r fig.width=8, fig.height = 4}
+DimPlot(sc_data, group.by = c("sample", "CD45"), reduction = "pca") &
+  theme_clean
+```
+
+#### Dimensionality determination
+
+> Dimensionality of the dataset was then assessed using the JackStraw and ElbowPlot functions.
+
+From Seurat documentation, we see that JackStraw is quite computationally intensive:
+
+> In Macosko et al, we implemented a resampling test inspired by the JackStraw procedure. While still available in Seurat (see previous vignette), this is a slow and computationally expensive procedure, and we is no longer routinely used in single cell analysis.
+
+This is not the most beautiful Elbow plot ever, but the idea is to find the "inflection point" of the plot (I'm estimating at about 10) and go a little bit further into the "stable" area, where adding more dimensions doesn't add more infromation.
+
+```{r fig.width = 5, fig.height=3}
+ElbowPlot(sc_data, ndims = 30)
+```
+
+For methods that require the dimensionality, we'll set it at 15.
+
+### Doublet detection
+
+It's never a bad idea to add some doublet detection.
+
+Doublets are UMIs that contained more than one cell and thefore have a mixed profile.
+
+This benchmark shows some of the main methods (though new ones may emerge): https://www.sciencedirect.com/science/article/pii/S2405471220304592
+
+We'll use cxds from scdc because it's fast and reasonably accurate.
+
+However, it uses a `SingleCellExperiment` standard. Luckily, we can easily convert between `SeuratObject` and `SingleCellExperiment`.
+
+```{r}
+cxds_scores <- lapply(SplitObject(sc_data, split.by = "sample"), function(samp_sc) {
+  sce <- samp_sc |>
+    as.SingleCellExperiment() |>
+    cxds()
+  return(sce$cxds_score)
+})
+gc()
+names(cxds_scores) <- NULL
+sc_data$cxds_scores <- do.call(c, cxds_scores)[Cells(sc_data)]
+```
+
+## Clustering
+
+> Clusters were calculated \[...\]
+
+Before clustering, we need to establish a neighborhood graph and compute shared nearest neighbors (SNN). We'll do this on 15 PCs:
+
+```{r}
+sc_data <- FindNeighbors(sc_data, dims = 1:15)
+```
+
+From this, we can use "FindClusters" for Louvain clustering, which uses a rather temperamental "resolution" parameter, very dependent on datasets usually.
+
+The largest the "resolution", the more clusters are obtained.
+
+```{r}
+sc_data <- FindClusters(sc_data, resolution = 0.5, cluster.name = "unintegrated_clusters")
+```
+
+UMAP and t-SNE are dimensionality reductions for visualization. They are very popular and we'll use them widely. They minimize local distances, often making "neat" looking clusters.
+
+Be wary of not using the UMAP projection itself as an input for analysis, as they contain lots of data distortions (which is normal of anything that is reducing a space of 3000 features to 2 dimensions)
+
+> \[...\] and data dimensions were reduced using the t-SNE and UMAP methods.
+
+```{r}
+sc_data <- RunUMAP(sc_data, dims = 1:15)
+```
+
+We can check the state of our Seurat object:
+
+```{r}
+sc_data
+```
+
+And plot the Seurat clusters... only to find we're definitely clustering per sample.
+
+```{r fig.width = 12, fig.height=5}
+DimPlot(sc_data, group.by = c("unintegrated_clusters", "sample"), reduction = "umap", alpha = 0.3) & 
+  theme_clean
+```
+
+## Integration
+
+Batch effect is rampant in single-cell RNA-seq and there are lots of integration methods proposed to deal with this. They often return a dimensionality reduction (more precisely, latent space) that minimizes this batch effect.
+
+There are 5 methods implemented in Seurat alone. We'll use Harmony, because it's fairly fast and effective.
+
+See the reference tutorial: https://satijalab.org/seurat/articles/seurat5_integration
+
+> Bulk cells were merged for the HLA analysis, while CD8 T cells only were merged for the CD8 T cell analysis. CD8 T cells were identified using the FindAllMarkers and the VlnPlot functions.
+
+```{r}
+sc_data <- IntegrateLayers(sc_data, 
+                           method = HarmonyIntegration,
+                           orig.reduction = "pca", 
+                           new.reduction = "harmony",
+  verbose = FALSE
+)
+gc()
+```
+
+We'll need re-run clustering algorithm in the Harmony latent space (here, using 30 dimensions)
+
+```{r}
+sc_data <- FindNeighbors(sc_data, reduction = "harmony", dims = 1:30)
+sc_data <- FindClusters(sc_data, resolution = 0.5, cluster.name = "harmony_clusters")
+```
+
+We can also run a UMAP in this latent space:
+
+```{r}
+sc_data <- RunUMAP(sc_data, reduction = "harmony", dims = 1:30, reduction.name = "umap_harmony")
+```
+
+```{r fig.width = 12, fig.height=7}
+DimPlot(sc_data, 
+        group.by = c("unintegrated_clusters", "harmony_clusters", "sample"), 
+        reduction = "umap_harmony",
+        alpha = 0.2,
+        ncol = 2) & 
+  theme_clean
+```
+
+### Check biases
+
+We can check back on our features that could be markers of bias in a cluster, and check back in with our doublet scores:
+
+```{r}
+sc_data$cxds_scores[1:5]
+```
+
+```{r fig.width = 12}
+RidgePlot(sc_data, 
+        features = c("nCount_RNA", "nFeature_RNA", 
+                     "percent.mt","cxds_scores"), 
+        ncol = 2) &
+  guides(fill = "none") &
+  theme_clean 
+```
+
+We can see, for example, that cluster 17 seems to be enriched in doublets.
+
+To compare the co-occurence of two categorical variables, we can do a heatmap:
+
+```{r}
+table(sc_data$harmony_clusters, sc_data$sample) |>
+  pheatmap(scale = "row")
+```
+
+From this, we can exclude cluster 17:
+
+```{r}
+sc_data <- subset(sc_data, subset = harmony_clusters != 17)
+```
+
+## Annotation
+
+### Differential Expression
+
+Differential expression analysis will by default run on the "identity" feature, which we make sure to set as "harmony_clusters" at this point:
+
+```{r}
+Idents(sc_data) <- sc_data$harmony_clusters
+Idents(sc_data)[1:5]
+```
+
+For differential analysis to use all layers at the same time, we need to join them before finding markers (each clusters vs all others):
+
+```{r}
+sc_data <- JoinLayers(sc_data)
+markers <- FindAllMarkers(sc_data)
+```
+
+For annotation, we can now use this table:
+
+```{r}
+markers |> head()
+```
+
+And visualize either top markers or any chosen features in many different ways:
+
+```{r}
+top_markers <- markers |>
+    group_by(cluster) |>
+    dplyr::filter(avg_log2FC > 1) |>
+    arrange(p_val_adj) |>
+    slice_head(n = 5) |>
+    ungroup()
+top5 <- unique(top_markers$gene)
+```
+
+#### Heatmap
+
+The heatmap takes a while to run, but provides a comprehensive view of a marker expression over the cells:
+
+```{r fig.width = 10, fig.heigth = 10}
+DoHeatmap(sc_data, features = top5, raster = TRUE) +
+  scale_fill_viridis_c()
+```
+
+#### Dot plot
+
+The dotplot summarizes the information into the heatmap and gives the same importance to all clusters, independent of size:
+
+```{r fig.width=15}
+DotPlot(sc_data, features = top5, cluster.idents = TRUE) + theme_clean
+```
+
+#### FeaturePlot
+
+`FeaturePlot` is the same as `DimPlot`, but using one or many continuous values instead:
+
+```{r fig.width=8, fig.height=12}
+FeaturePlot(sc_data, reduction = "umap_harmony",
+            features = c("CD3D", "MS4A1",
+                         "CD14", "PECAM1",
+                         "KRT20", "KRT5")) &
+  theme_void()
+```
+
+### Reference-based
+
+There are an infinity of methods for cell type annotation. I've found that using a good reference is more important than the method for annotation.
+
+We'll show reference-based annotation using SingleR, mostly because it's easy to use but also well performing.
+
+#### "Built-in" references
+
+Every automatic annotation method uses a reference. `celldex` provides an easy way to access some annotation sources, notably the Human Primary Cell Atlas, which we will use in this example.
+
+```{r}
+library(celldex)
+surveyReferences() |>  as_tibble()
+```
+
+```{r}
+hpca_se <- celldex::HumanPrimaryCellAtlasData()
+hpca_se
+```
+
+It's given as a `SummarizedExperiment` of purified bulk tumors.=, annotated as follows:
+
+```{r}
+unique(hpca_se$label.main)
+```
+
+There's also a finer annotation, which we won't use:
+
+```{r}
+unique(hpca_se$label.fine) |> head(n = 20)
+```
+
+SingleR is really simple to use, we just need to provide an expression matrix and reference as `SummarizedExperiment`:
+
+```{r}
+library(SingleR)
+pred_hpca <- SingleR(test = GetAssayData(sc_data), ref = hpca_se, assay.type.test=1,
+    labels = hpca_se$label.main)
+pred_hpca
+```
+
+Once we have the predictions, I add it to the Seurat object:
+
+```{r}
+sc_data@tools[["SingleR"]] <- pred_hpca |> as.data.frame()
+sc_data$singleR_pred <- pred_hpca$pruned.labels
+```
+
+##### Harmonizing automatic predictions
+
+We can check the prediction results and "harmonize" them by cluster, i.e. take the cluster-level mode of the annotation:
+
+```{r}
+harmony_singler <- table(sc_data$singleR_pred, factor(sc_data$harmony_clusters))
+pheatmap::pheatmap(harmony_singler, scale = "column")
+```
+
+```{r}
+harmony_map1 <- apply(harmony_singler, 2, function(x) names(which.max(x)))
+harmony_map1 <- structure(names(harmony_map1), names = harmony_map1)
+harmony_map1
+```
+
+```{r}
+sc_data$singleR_clean <- fct_recode(sc_data$harmony_clusters, !!! harmony_map1)
+```
+
+If we plot, we can see the difference between the "pred" and "clean":
+
+```{r fig.width=12, fig.height=7}
+DimPlot(sc_data, 
+        group.by = c("harmony_clusters", "singleR_pred", 
+                     "singleR_clean", "sample"), 
+        reduction = "umap_harmony",
+        ncol = 2,
+        alpha = 0.2) & 
+  theme_clean &
+  scale_color_igv()
+```
+
+#### Single-cell
+
+Most methods will work best with a relevant single-cell reference.
+
+Here is a not-so-recent but independent benchmark: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1795-z
+
+It can be interesting to try to use this tutorial to annotate a query dataset based on a reference atlas: https://satijalab.org/seurat/articles/integration_mapping
+
+## Extras
+
+### Sub-cluster
+
+In their manuscript, Salomé et al selected the T cells and subclustered them. This is a common strategy when there is a main population of interest. In fact, most of their analysis concentrated on the CD8 T cells.
+
+At this point, we could take our annotated data, subset the T cells and re-run the pipeline to find new relevant subgroups.
+
+### Trajectory analysis
+
+Trajectory analysis is used to reconstruct and visualize the dynamic processes of cellular development, differentiation, and state transitions. It infers the order of cells in a particular trajectory, allows us to calculate continuous "pseudotimes".
+
+It can be used to map out potential lineage relationships, identify intermediate cell states, and elucidate the pathways underlying tissue development, immune responses, or disease progression, for example.
+
+In Figure 4, Salomé et al used this to show a subset of differentiated PD-1+ TRM CD8+ T Cells that retain independent function.
+
+![](images/Screenshot from 2025-02-13 18-42-25.png)
+
+A not so new but very comprehensive benchmark of trajectory inference by Saelens et al is a great jumping point: <https://www.nature.com/articles/s41587-019-0071-9>
+
+Accompanied by the superb dynverse wrappers, which provide all methods in the benchmark, as well as guidance on what to choose: <https://dynverse.org/>
+
+### Cell cycle
+
+There are many methods to infer cell cycle stage and score cell cycle in Seurat, but it also has a built in one that works quite decently:
+
+```{r}
+sc_data <- CellCycleScoring(sc_data, 
+                 s.features = cc.genes.updated.2019$s.genes, 
+                 g2m.features = cc.genes.updated.2019$g2m.genes)
+```
+
+```{r fig.width=8, fig.height=4}
+FeaturePlot(sc_data, 
+        features = c("S.Score", "G2M.Score"),
+        reduction = "umap_harmony",
+        ncol = 2,
+        alpha = 0.2) & 
+  theme_clean
+```
+
+We can see very little cycling except in one "epithelial" (tumor) area we previously annotated.
+
+### RNA velocity
+
+RNA velocity is a computation method that attempts to predict the future transcriptional state of individual cells. It distinguishes between unspliced (pre-mRNA) and spliced (mature mRNA) transcripts within each cell, and therefore necessitates a special input in which these reads have been separated. This differentiation allows the estimation of the rate at which genes are being transcribed and processed, providing insights into the "direction" and "speed" of cellular state changes.
+
+The primary goal of RNA velocity analysis is to elucidate the trajectories of cellular differentiation, activation, and other dynamic processes, thereby offering a deeper understanding of cellular development and lineage relationships. By forecasting how cells are likely to evolve, it can help in identifying transient cell states, and uncovering mechanisms underlying tissue development, regeneration, and disease progression.
+
+It can be used together with traditional trajectory analysis.
+
+Most RNA velocity tools work in Python, the two most well-known being `velocyto` and `scVelo`. Both have tutorials showing how to use reticulate to run their workflows in R.
+
+### Pathway enrichment
+
+Pathway enrichment aims to identify biological pathways, processes, or functional categories that are significantly overrepresented within a set of genes of interest, such as those differentially expressed between distinct cell populations or states.
+
+This analysis typically involves mapping the selected genes to curated pathway databases like Gene Ontology, KEGG, or Reactome and applying statistical methods to assess the significance of their enrichment.
+
+There are many methods to do this, but a easy to use is decoupleR, in which AUCell is implemented, which is a well-performing scoring method: <https://www.bioconductor.org/packages/release/bioc/vignettes/decoupleR/inst/doc/decoupleR.html>
+
+### Gene regulatory network
+
+Gene regulatory network (GRN) analysis seeks to identify key transcription factors, regulatory motifs, and signaling pathways that drive cell states, differentiation, and responses to environmental stimuli. The ultimate goal of GRN analysis is to map out the regulatory architecture that underpins cellular heterogeneity, enabling \\ to pinpoint master regulators and understand the molecular mechanisms underlying various biological processes and disease states.
+
+From an algorithmic point of view, this involves inferring relationships such as gene co-expression, regulatory influences, and causal interactions.
+
+SCENIC is the most popular method to do this, with the Python implementation being much more performant (<https://github.com/aertslab/pySCENIC>). The protocol is probably the best way to run this type of analysis currently: <https://github.com/aertslab/SCENICprotocol>
+
+### CNV analysis
+
+Copy Number Variation (CNV) analysis is a computational approach used to infer genomic copy number alterations from transcriptomic data. It leverages the variability in gene expression levels across the genome to detect gains or losses of genomic regions.
+
+This method is particularly valuable in studies of cancer and other genetic disorders, where CNVs play a crucial role in disease progression and heterogeneity.
+
+The most well-known tool used for this analysis is inferCNV, which can be extremely slow and doesn't perform very well with cells with low-read count. This is why we implemented FastCNV, available to install for R on Github: <https://github.com/must-bioinfo/fastCNVdata>
+
+### Ligand-receptor analysis
+
+Ligand-receptor analysis is a computational strategy to infer cell-cell communication by identifying interactions between signaling molecules (ligands) and their corresponding receptors expressed on different cell types or states.
+
+This analysis involves systematically pairing ligands expressed by one or more cell populations with receptors expressed by neighboring or interacting cells, thereby predicting potential signaling pathways that facilitate intercellular communication.
+
+Well known tools are CellPhoneDB and CellChat, but LIANA+ provides wrappers and an all-in-one framework for this kind of analysis: <https://liana-py.readthedocs.io/en/latest/>
+
+Notably, this analysis can be much more powerful in spatially-resolved data.
+
+### Object conversion
+
+Format conversion is often necessary when working with single-cell RNA-seq to use
+tools available for different objects.
+
+This can be easy between SingleCellExperiment and SeuratObject, as we used it
+in this tutorial with `as.SingleCellExperiment` and `as.Seurat`.
+
+However, these functions sometimes don't work, and resolving for 
+
+```{r}
+pbmc <- MairPBMCData()
+pbmc
+as.Seurat(pbmc)
+```
+`sceasy` does a better job at conversions and supports AnnData standards:
+
+```{r}
+if(!"sceasy" %in% installed.packages()) { remotes::install_github("cellgeni/sceasy") }
+library(sceasy)
+```
+
+
