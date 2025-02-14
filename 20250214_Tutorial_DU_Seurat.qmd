@@ -654,18 +654,10 @@ tools available for different objects.
 This can be easy between SingleCellExperiment and SeuratObject, as we used it
 in this tutorial with `as.SingleCellExperiment` and `as.Seurat`.
 
-However, these functions sometimes don't work, and resolving for 
+However, these functions sometimes don't work and the Seurat solution for h5
+objects, SeuratDisk, fails its own tutorial. `sceasy` (https://github.com/cellgeni/sceasy) 
+was made to resolve these conversion problems.
 
-```{r}
-pbmc <- MairPBMCData()
-pbmc
-as.Seurat(pbmc)
-```
-`sceasy` does a better job at conversions and supports AnnData standards:
 
-```{r}
-if(!"sceasy" %in% installed.packages()) { remotes::install_github("cellgeni/sceasy") }
-library(sceasy)
-```
 
 
