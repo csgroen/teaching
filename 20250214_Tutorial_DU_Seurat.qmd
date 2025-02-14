@@ -15,7 +15,7 @@ format:
     code-tools: true
 ---
 
-Download this notebook: https://github.com/downloads/csgroen/teaching/20250214_Tutorial_DU_Seurat.qmd
+Download this notebook: https://raw.githubusercontent.com/csgroen/teaching/refs/heads/main/20250214_Tutorial_DU_Seurat.qmd
 
 ## Pre-requisites
 
